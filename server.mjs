@@ -1,5 +1,6 @@
 // Minimal worker that logs in to webDiplomacy phpBB and fetches a page title.
-// Protects endpoints with a bearer token so only your site can call it.
+// Public routes: GET /, GET /healthz
+// Protected route: POST /preview   (Authorization: Bearer WORKER_TOKEN)
 
 import express from 'express'
 
@@ -9,7 +10,7 @@ app.use(express.json())
 const PORT = process.env.PORT || 8080
 const USER = process.env.FORUM_USERNAME || ''
 const PASS = process.env.FORUM_PASSWORD || ''
-const TOKEN = process.env.WORKER_TOKEN || '' // choose any long random string
+const TOKEN = process.env.WORKER_TOKEN || '' // set this in Render + Vercel
 
 // --- tiny helpers -----------------------------------------------------------
 
@@ -63,28 +64,31 @@ function isPhpBB(url) {
   return /https?:\/\/(www\.)?webdiplomacy\.net\/contrib\/phpBB3\//i.test(url)
 }
 
-// --- auth middleware --------------------------------------------------------
+// --- public routes ----------------------------------------------------------
 
-app.use((req, res, next) => {
+app.get('/', (_req, res) => res.status(200).send('webdip-mafia-worker: ok'))
+app.get('/healthz', (_req, res) => res.json({ ok: true }))
+
+// --- auth middleware (used only on protected routes) -----------------------
+
+function auth(req, res, next) {
   if (!TOKEN) return res.status(500).json({ error: 'WORKER_TOKEN not set' })
   const hdr = req.get('authorization') || ''
   if (!hdr.startsWith('Bearer ') || hdr.slice(7) !== TOKEN) {
     return res.status(401).json({ error: 'Unauthorized' })
   }
   next()
-})
+}
 
-// --- routes -----------------------------------------------------------------
+// --- protected routes -------------------------------------------------------
 
-app.get('/healthz', (_, res) => res.json({ ok: true }))
-
-app.post('/preview', async (req, res) => {
+app.post('/preview', auth, async (req, res) => {
   try {
     const url = String(req.body?.url || '').trim()
     if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'Valid URL required' })
 
+    // Non-phpBB: unauthenticated fetch
     if (!isPhpBB(url)) {
-      // Non-phpBB: fetch without login
       const r = await fetch(url, {
         headers: {
           'user-agent': 'Mozilla/5.0 WebDipMafiaWorker/1.0',
@@ -136,7 +140,7 @@ app.post('/preview', async (req, res) => {
         cookieJar
       )
       cookieJar = mergeCookiePairs(cookieJar, ...p2)
-      // Not strictly verifying here; we’ll attempt the thread fetch regardless.
+      // Continue either way; some skins hide logout on index.
     }
 
     // 3) Fetch thread
@@ -150,9 +154,7 @@ app.post('/preview', async (req, res) => {
     const html = await topicRes.text()
 
     if (!/html/i.test(ctype)) return res.json({ url, title: null, note: `Unsupported content-type: ${ctype}`, status })
-    if (/only users can view/i.test(html)) {
-      return res.json({ url, title: null, note: 'Page restricted after login (anti-bot)', status })
-    }
+    if (/only users can view/i.test(html)) return res.json({ url, title: null, note: 'Page restricted after login (anti-bot)', status })
 
     return res.json({ url, title: extractTitle(html), status })
   } catch (e) {
